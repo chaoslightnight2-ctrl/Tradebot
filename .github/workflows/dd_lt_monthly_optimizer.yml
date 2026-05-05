@@ -1,7 +1,5 @@
 name: DD below monthly optimizer
 
-# Runs the optimizer for the rule: abs(max_drawdown_pct) < monthly_return_pct.
-# Main trigger refresh.
 on:
   workflow_dispatch:
     inputs:
@@ -12,25 +10,17 @@ on:
       timeout_seconds:
         description: Optimizer timeout seconds
         required: true
-        default: "7200"
+        default: "18000"
       max_trials:
         description: Maximum randomized trials before timeout
         required: true
-        default: "1500"
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "tools/optimize_dd_lt_monthly.py"
-      - ".github/workflows/dd_lt_monthly_optimizer.yml"
-      - "sontrade_bot.py"
-      - "requirements.txt"
+        default: "5000"
   push:
     branches:
       - main
-      - optimize-risk-return
     paths:
       - "tools/optimize_dd_lt_monthly.py"
+      - "tools/optimize_monthly15_lowdd.py"
       - ".github/workflows/dd_lt_monthly_optimizer.yml"
       - "sontrade_bot.py"
       - "requirements.txt"
@@ -38,7 +28,7 @@ on:
 jobs:
   optimize:
     runs-on: ubuntu-latest
-    timeout-minutes: 125
+    timeout-minutes: 310
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,12 +47,12 @@ jobs:
         env:
           SONTRADE_DATA_PROVIDER: yfinance
         run: |
-          python tools/optimize_dd_lt_monthly.py \
+          python tools/optimize_monthly15_lowdd.py \
             --symbols "${{ github.event.inputs.symbols || 'AAPL' }}" \
             --lookback-days 2500 \
-            --timeout-seconds "${{ github.event.inputs.timeout_seconds || '7200' }}" \
-            --max-trials "${{ github.event.inputs.max_trials || '1500' }}" \
-            --min-monthly-return-pct 5 \
+            --timeout-seconds "${{ github.event.inputs.timeout_seconds || '18000' }}" \
+            --max-trials "${{ github.event.inputs.max_trials || '5000' }}" \
+            --min-monthly-return-pct 15 \
             --min-total-trades 80 \
             --min-oos-trades 30
 
@@ -77,7 +67,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dd-lt-monthly-optimizer-reports
+          name: monthly15-lowdd-optimizer-reports
           path: |
             reports/dd_lt_monthly_optimizer_trials.jsonl
             reports/dd_lt_monthly_valid_candidates.json
