@@ -41,6 +41,40 @@ python sontrade_bot.py trade
 python sontrade_bot.py loop
 ```
 
+## DD aylık getiriden düşük optimizer
+
+Bu optimizer sadece backtest yapar; paper/live emir göndermez. Amaç, en az 5 yıllık veriyle aylık getirisi `%5` üstünde ve `abs(max_drawdown_pct) < monthly_return_pct` şartını sağlayan ayarları bulmaktır.
+
+```bash
+python tools/optimize_dd_lt_monthly.py \
+  --symbols AAPL \
+  --lookback-days 2500 \
+  --timeout-seconds 7200 \
+  --min-monthly-return-pct 5 \
+  --min-total-trades 80 \
+  --min-oos-trades 30
+```
+
+Üretilen raporlar:
+
+```text
+reports/dd_lt_monthly_optimizer_trials.jsonl
+reports/dd_lt_monthly_valid_candidates.json
+reports/dd_lt_monthly_best_config.json
+reports/DD_LT_MONTHLY_OPTIMIZER_REPORT.md
+```
+
+Kabul kapıları:
+
+```text
+monthly_return_pct > 5
+abs(max_drawdown_pct) < monthly_return_pct
+full trade_count >= 80
+OOS trade_count >= 30
+OOS şartları da geçmeli
+walk-forward pass_rate >= 0.60
+```
+
 ## Ücretsiz veri modu
 
 Backtest için API key istemeden denemek istersen:
