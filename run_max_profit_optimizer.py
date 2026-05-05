@@ -5,10 +5,17 @@ Just run:
   python run_max_profit_optimizer.py
 
 Goal:
-  Maximize monthly net profit while keeping max drawdown under 10%.
+  Find a model where:
+    monthly net profit > 5%
+    monthly net profit > absolute max drawdown
+    absolute max drawdown < 10%
+
+If multiple valid models are found, keep the highest monthly net profit.
+If timeout happens, save the best model found so far.
 
 Defaults:
   timeout = 3 hours
+  target monthly return = 5%
   max drawdown = 10%
   feature-group search = enabled
   verification backtests = 3
@@ -27,6 +34,7 @@ from typing import Any
 import optimize_until_target as opt
 import sontrade_bot as bot
 
+TARGET_MONTHLY = 0.05
 MAX_DD = 0.10
 TIMEOUT_HOURS = 3.0
 VERIFY_RUNS = 3
@@ -42,35 +50,59 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def max_profit_objective(result: dict[str, Any]) -> float:
+def metrics(result: dict[str, Any]) -> tuple[float, float, float, float]:
     monthly = opt.calc_monthly_return(result)
     dd = abs(safe_float(result.get("max_drawdown", 1.0), 1.0))
     trades = safe_float(result.get("trades", 0), 0.0)
     win_rate = safe_float(result.get("win_rate", 0.0), 0.0)
+    return monthly, dd, trades, win_rate
 
-    # Main objective: among models with DD <= 10%, maximize monthly return.
-    if dd <= MAX_DD and trades > 0:
+
+def target_valid(result: dict[str, Any]) -> bool:
+    monthly, dd, trades, _ = metrics(result)
+    return trades > 0 and monthly >= TARGET_MONTHLY and monthly > dd and dd <= MAX_DD
+
+
+def dd_valid(result: dict[str, Any]) -> bool:
+    monthly, dd, trades, _ = metrics(result)
+    return trades > 0 and dd <= MAX_DD and monthly > 0
+
+
+def target_objective(result: dict[str, Any]) -> float:
+    monthly, dd, trades, win_rate = metrics(result)
+    monthly_minus_dd = monthly - dd
+
+    # Best case: monthly >= 5%, monthly > DD, and DD <= 10%.
+    # Among valid models, maximize monthly profit, then margin above DD.
+    if trades > 0 and monthly >= TARGET_MONTHLY and monthly > dd and dd <= MAX_DD:
+        score = 3_000_000.0
+        score += monthly * 30_000.0
+        score += monthly_minus_dd * 20_000.0
+        score += win_rate * 75.0
+        score += min(trades, 300.0)
+        score -= dd * 250.0
+        return round(score, 6)
+
+    # Second priority: DD-valid and profitable, but not yet monthly > 5 and > DD.
+    if trades > 0 and dd <= MAX_DD and monthly > 0:
         score = 1_000_000.0
         score += monthly * 10_000.0
+        score += monthly_minus_dd * 8_000.0
+        score -= max(0.0, TARGET_MONTHLY - monthly) * 30_000.0
+        score -= max(0.0, dd - monthly) * 30_000.0
         score += win_rate * 50.0
-        score += min(trades, 250.0)
+        score += min(trades, 300.0)
         score -= dd * 200.0
         return round(score, 6)
 
-    # Fallback objective if no DD-valid model has been found yet.
+    # Fallback: no acceptable model yet, heavily punish DD over 10% and non-positive monthly profit.
     score = monthly * 100.0
+    score += monthly_minus_dd * 100.0
     score -= max(0.0, dd - MAX_DD) * 20_000.0
     score -= dd * 300.0
     if trades < 8:
         score -= 100.0
     return round(score, 6)
-
-
-def dd_valid(result: dict[str, Any]) -> bool:
-    return (
-        int(result.get("trades", 0) or 0) > 0
-        and abs(safe_float(result.get("max_drawdown", 1.0), 1.0)) <= MAX_DD
-    )
 
 
 def main() -> int:
@@ -85,12 +117,13 @@ def main() -> int:
     best_candidate: opt.Candidate | None = None
     best_train: dict[str, Any] = {}
     best_bt: dict[str, Any] = {"objective_score": -10**18}
-    best_valid_under_dd = False
+    best_dd_valid = False
+    best_target_valid = False
     trial_count = 0
     start = time.time()
 
     print(
-        "Sıfır-parametre optimizer başladı | hedef: DD <%10 şartıyla aylık net kârı maksimize et | "
+        "Optimizer başladı | hedef: aylık net kâr > %5, aylık net kâr > DD, DD <%10 | "
         f"timeout={TIMEOUT_HOURS:.2f} saat | feature_group_search=True"
     )
 
@@ -103,33 +136,39 @@ def main() -> int:
         trial_count += 1
         try:
             train_metrics, bt_metrics = opt.run_train_backtest(candidate, quiet=QUIET)
-            bt_metrics["objective_score"] = max_profit_objective(bt_metrics)
+            bt_metrics["objective_score"] = target_objective(bt_metrics)
             bt_metrics["clear_summary"] = opt.clear_backtest_summary(bt_metrics)
         except Exception as exc:
             print(f"[trial {trial_count}] HATA: {exc}")
             continue
 
-        valid = dd_valid(bt_metrics)
-        previous_valid = best_valid_under_dd
+        valid_target = target_valid(bt_metrics)
+        valid_dd = dd_valid(bt_metrics)
         current_score = safe_float(bt_metrics.get("objective_score"), -10**18)
         best_score = safe_float(best_bt.get("objective_score"), -10**18)
 
-        # Prefer any DD-valid model over DD-invalid models. Among DD-valid models, maximize monthly profit.
         is_best = False
-        if valid and not previous_valid:
+        if valid_target and not best_target_valid:
             is_best = True
-        elif valid == previous_valid and current_score > best_score:
-            is_best = True
+        elif valid_target == best_target_valid:
+            if valid_dd and not best_dd_valid:
+                is_best = True
+            elif valid_dd == best_dd_valid and current_score > best_score:
+                is_best = True
 
         if is_best:
             best_candidate = candidate
             best_train = train_metrics
             best_bt = bt_metrics
-            best_valid_under_dd = valid
+            best_target_valid = valid_target
+            best_dd_valid = valid_dd
             summary = opt.clear_backtest_summary(bt_metrics)
+            monthly = opt.calc_monthly_return(bt_metrics)
+            dd = abs(safe_float(bt_metrics.get("max_drawdown", 0.0), 0.0))
             print(
-                f"[trial {trial_count}] YENİ EN İYİ | dd_valid={valid} "
+                f"[trial {trial_count}] YENİ EN İYİ | target_valid={valid_target} dd_valid={valid_dd} "
                 f"monthly={summary['monthly_net_profit_pct']}% dd={summary['max_drawdown_pct']}% "
+                f"monthly_minus_dd_pct={round((monthly - dd) * 100, 4)}% "
                 f"win={summary['win_rate_pct']}% trades={summary['total_trades']} "
                 f"L/S={summary['long_trades']}/{summary['short_trades']} "
                 f"score={bt_metrics['objective_score']} groups={len(candidate.enabled_groups)}/{len(opt.ALL_GROUPS)} "
@@ -144,24 +183,34 @@ def main() -> int:
     verification = opt.verify_best(best_candidate, runs=VERIFY_RUNS, quiet=QUIET)
     elapsed = time.time() - start
 
+    # Add monthly-minus-DD values for readability.
+    monthly = opt.calc_monthly_return(best_bt)
+    dd = abs(safe_float(best_bt.get("max_drawdown", 0.0), 0.0))
+    best_bt["monthly_minus_abs_drawdown"] = monthly - dd
+    best_bt["monthly_minus_abs_drawdown_pct"] = round((monthly - dd) * 100, 4)
+
     opt.save_outputs(
         best_candidate=best_candidate,
         best_train=best_train,
         best_backtest=best_bt,
         verification=verification,
-        target_monthly=0.0,
+        target_monthly=TARGET_MONTHLY,
         max_dd=MAX_DD,
         timeout_hit=True,
-        found_target=best_valid_under_dd,
+        found_target=best_target_valid,
         trial_count=trial_count,
         elapsed_sec=elapsed,
     )
 
     final_summary = opt.clear_backtest_summary(best_bt)
     print("\n=== SONUÇ ===")
-    print(f"dd_valid_under_10={best_valid_under_dd} trials={trial_count} elapsed_sec={elapsed:.2f}")
+    print(
+        f"target_monthly_gt_5_and_monthly_gt_dd_and_dd_under_10={best_target_valid} "
+        f"dd_valid_under_10={best_dd_valid} trials={trial_count} elapsed_sec={elapsed:.2f}"
+    )
     print(
         f"best monthly={final_summary['monthly_net_profit_pct']}% | dd={final_summary['max_drawdown_pct']}% | "
+        f"monthly_minus_dd={best_bt['monthly_minus_abs_drawdown_pct']}% | "
         f"net={final_summary['net_compounded_profit_pct']}% | win={final_summary['win_rate_pct']}% | "
         f"trades={final_summary['total_trades']} | long={final_summary['long_trades']} "
         f"({final_summary['long_trade_ratio_pct']}%) | short={final_summary['short_trades']} "
