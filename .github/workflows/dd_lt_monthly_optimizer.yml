@@ -1,6 +1,7 @@
 name: DD below monthly optimizer
 
 # Runs the optimizer for the rule: abs(max_drawdown_pct) < monthly_return_pct.
+# Main trigger refresh.
 on:
   workflow_dispatch:
     inputs:
