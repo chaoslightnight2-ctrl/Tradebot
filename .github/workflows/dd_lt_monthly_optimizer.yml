@@ -26,6 +26,7 @@ on:
       - "requirements.txt"
   push:
     branches:
+      - main
       - optimize-risk-return
     paths:
       - "tools/optimize_dd_lt_monthly.py"
