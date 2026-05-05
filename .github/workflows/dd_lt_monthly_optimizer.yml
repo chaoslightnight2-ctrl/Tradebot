@@ -1,5 +1,6 @@
 name: DD below monthly optimizer
 
+# Trigger refresh: run optimizer on optimize-risk-return pushes.
 on:
   workflow_dispatch:
     inputs:
