@@ -14,6 +14,7 @@ API keys are read from .env or environment variables. Do not hardcode keys in pu
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import math
@@ -37,7 +38,6 @@ from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeIn
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, StopLossRequest, TakeProfitRequest
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, precision_score, roc_auc_score
-from sklearn.model_selection import train_test_split
 
 APP_DIR = Path(__file__).resolve().parent
 MODEL_PATH = APP_DIR / "sontrade_model.joblib"
@@ -48,6 +48,7 @@ FEATURES = [
     "ema200_dist", "rsi14", "atr_pct", "vol_z20", "range_pct", "breakout20",
     "drawdown20", "market_ret_5", "rel_ret_spy_5", "rel_ret_spy_20",
 ]
+
 
 @dataclass(frozen=True)
 class Config:
@@ -71,6 +72,15 @@ class Config:
     max_notional: float = 6000.0
     max_positions: int = 4
     min_order_dollars: float = 50.0
+    commission_bps_per_side: float = 0.0
+    spread_bps_round_trip: float = 2.0
+    slippage_bps_per_side: float = 1.0
+    short_borrow_apr: float = 0.03
+    fill_probability: float = 0.98
+    max_atr_pct_for_fill: float = 0.12
+    min_dollar_volume: float = 1_000_000.0
+    bars_per_year: int = 252
+    random_seed: int = 42
 
 
 def load_dotenv(path: Path = ENV_PATH) -> None:
@@ -82,13 +92,6 @@ def load_dotenv(path: Path = ENV_PATH) -> None:
             continue
         k, v = line.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-
-def env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_config() -> Config:
@@ -114,6 +117,15 @@ def load_config() -> Config:
         max_notional=float(os.getenv("SONTRADE_MAX_NOTIONAL", "6000")),
         max_positions=int(os.getenv("SONTRADE_MAX_POSITIONS", "4")),
         min_order_dollars=float(os.getenv("SONTRADE_MIN_ORDER_DOLLARS", "50")),
+        commission_bps_per_side=float(os.getenv("SONTRADE_COMMISSION_BPS_PER_SIDE", "0.0")),
+        spread_bps_round_trip=float(os.getenv("SONTRADE_SPREAD_BPS_ROUND_TRIP", "2.0")),
+        slippage_bps_per_side=float(os.getenv("SONTRADE_SLIPPAGE_BPS_PER_SIDE", "1.0")),
+        short_borrow_apr=float(os.getenv("SONTRADE_SHORT_BORROW_APR", "0.03")),
+        fill_probability=float(os.getenv("SONTRADE_FILL_PROBABILITY", "0.98")),
+        max_atr_pct_for_fill=float(os.getenv("SONTRADE_MAX_ATR_PCT_FOR_FILL", "0.12")),
+        min_dollar_volume=float(os.getenv("SONTRADE_MIN_DOLLAR_VOLUME", "1000000")),
+        bars_per_year=int(os.getenv("SONTRADE_BARS_PER_YEAR", "252")),
+        random_seed=int(os.getenv("SONTRADE_RANDOM_SEED", "42")),
     )
 
 
@@ -173,9 +185,24 @@ def fetch_yfinance(symbols: tuple[str, ...], cfg: Config) -> pd.DataFrame:
     end = utc_now()
     start = end - timedelta(days=cfg.lookback_days)
     for symbol in symbols:
-        df = yf.download(symbol, start=start.date().isoformat(), end=(end + timedelta(days=1)).date().isoformat(), interval=yf_interval(cfg.timeframe), auto_adjust=False, progress=False, threads=False)
+        df = yf.download(
+            symbol,
+            start=start.date().isoformat(),
+            end=(end + timedelta(days=1)).date().isoformat(),
+            interval=yf_interval(cfg.timeframe),
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
         if df.empty:
-            df = yf.download(symbol, period=f"{max(30, cfg.lookback_days)}d", interval=yf_interval(cfg.timeframe), auto_adjust=False, progress=False, threads=False)
+            df = yf.download(
+                symbol,
+                period=f"{max(30, cfg.lookback_days)}d",
+                interval=yf_interval(cfg.timeframe),
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
         if df.empty:
             logging.warning("No yfinance data for %s", symbol)
             continue
@@ -192,7 +219,13 @@ def fetch_yfinance(symbols: tuple[str, ...], cfg: Config) -> pd.DataFrame:
 
 def fetch_alpaca(symbols: tuple[str, ...], cfg: Config) -> pd.DataFrame:
     _, data = alpaca_clients()
-    req = StockBarsRequest(symbol_or_symbols=list(symbols), timeframe=parse_timeframe(cfg.timeframe), start=utc_now() - timedelta(days=cfg.lookback_days), end=utc_now(), feed=cfg.data_feed)
+    req = StockBarsRequest(
+        symbol_or_symbols=list(symbols),
+        timeframe=parse_timeframe(cfg.timeframe),
+        start=utc_now() - timedelta(days=cfg.lookback_days),
+        end=utc_now(),
+        feed=cfg.data_feed,
+    )
     df = data.get_stock_bars(req).df.reset_index()
     if df.empty:
         raise RuntimeError("Alpaca returned empty bars.")
@@ -228,7 +261,7 @@ def add_features(raw: pd.DataFrame, cfg: Config, require_targets: bool = True) -
         l = df["low"].astype(float)
         v = df["volume"].astype(float)
         prev = c.shift(1)
-        tr = pd.concat([(h-l), (h-prev).abs(), (l-prev).abs()], axis=1).max(axis=1)
+        tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
         atr = tr.rolling(14).mean()
         df["ret_1"] = c.pct_change(1)
         df["ret_3"] = c.pct_change(3)
@@ -241,6 +274,7 @@ def add_features(raw: pd.DataFrame, cfg: Config, require_targets: bool = True) -
         df["rsi14"] = (rsi(c, 14) - 50) / 50
         df["atr_pct"] = atr / c
         df["vol_z20"] = (v - v.rolling(20).mean()) / v.rolling(20).std().replace(0, np.nan)
+        df["dollar_volume"] = c * v
         df["range_pct"] = (h - l) / c
         df["breakout20"] = c / h.shift(1).rolling(20).max() - 1
         df["drawdown20"] = c / c.rolling(20).max() - 1
@@ -269,23 +303,36 @@ def build_dataset(cfg: Config, require_targets: bool = True) -> pd.DataFrame:
 
 def split_time(df: pd.DataFrame, frac: float = 0.78) -> tuple[pd.DataFrame, pd.DataFrame]:
     times = sorted(df["timestamp"].unique())
-    cut = times[max(1, min(len(times)-1, int(len(times)*frac)))]
+    cut = times[max(1, min(len(times) - 1, int(len(times) * frac)))]
     return df[df["timestamp"] < cut].copy(), df[df["timestamp"] >= cut].copy()
 
 
-def make_model() -> RandomForestClassifier:
-    return RandomForestClassifier(n_estimators=350, max_depth=6, min_samples_leaf=8, class_weight="balanced_subsample", random_state=42, n_jobs=-1)
+def make_model(cfg: Config) -> RandomForestClassifier:
+    return RandomForestClassifier(
+        n_estimators=350,
+        max_depth=6,
+        min_samples_leaf=8,
+        class_weight="balanced_subsample",
+        random_state=cfg.random_seed,
+        n_jobs=-1,
+    )
 
 
 def train(cfg: Config) -> dict[str, Any]:
     df = build_dataset(cfg)
     train_df, test_df = split_time(df)
-    long_model = make_model().fit(train_df[FEATURES], train_df["long_target"])
-    short_model = make_model().fit(train_df[FEATURES], train_df["short_target"])
+    long_model = make_model(cfg).fit(train_df[FEATURES], train_df["long_target"])
+    short_model = make_model(cfg).fit(train_df[FEATURES], train_df["short_target"])
     bundle = {"long_model": long_model, "short_model": short_model, "features": FEATURES, "config": asdict(cfg), "trained_at": utc_now().isoformat()}
     joblib.dump(bundle, MODEL_PATH)
     scored = score_frame(test_df, bundle)
-    metrics = {"rows": len(df), "train_rows": len(train_df), "test_rows": len(test_df), "long": model_metrics(test_df["long_target"], scored["long_score"]), "short": model_metrics(test_df["short_target"], scored["short_score"])}
+    metrics = {
+        "rows": len(df),
+        "train_rows": len(train_df),
+        "test_rows": len(test_df),
+        "long": model_metrics(test_df["long_target"], scored["long_score"]),
+        "short": model_metrics(test_df["short_target"], scored["short_score"]),
+    }
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
     return metrics
 
@@ -312,7 +359,27 @@ def score_frame(df: pd.DataFrame, bundle: dict[str, Any]) -> pd.DataFrame:
     return out
 
 
-def realized_return(row: pd.Series, side: str, cfg: Config) -> float:
+def deterministic_unit_interval(*parts: object) -> float:
+    raw = "|".join(str(p) for p in parts).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    return int(digest, 16) / float(16**12 - 1)
+
+
+def should_fill(row: pd.Series, side: str, cfg: Config) -> bool:
+    if float(row.get("dollar_volume", 0.0)) < cfg.min_dollar_volume:
+        return False
+    atr_pct = float(row.get("atr_pct", 0.0))
+    if np.isfinite(atr_pct) and atr_pct > cfg.max_atr_pct_for_fill:
+        return False
+    fill_probability = min(1.0, max(0.0, cfg.fill_probability))
+    if np.isfinite(atr_pct):
+        fill_probability -= max(0.0, atr_pct - 0.04) * 1.5
+    fill_probability = min(1.0, max(0.0, fill_probability))
+    key = deterministic_unit_interval(row.get("timestamp"), row.get("symbol"), side, cfg.random_seed)
+    return key <= fill_probability
+
+
+def realized_gross_return(row: pd.Series, side: str, cfg: Config) -> float:
     entry = float(row["close"])
     atr_pct = float(row.get("atr_pct", 0.0))
     stop_pct = min(cfg.max_stop_pct, max(cfg.min_stop_pct, atr_pct * cfg.stop_atr_mult))
@@ -337,12 +404,31 @@ def realized_return(row: pd.Series, side: str, cfg: Config) -> float:
     return fallback
 
 
+def backtest_costs(row: pd.Series, side: str, cfg: Config) -> dict[str, float]:
+    commission = 2.0 * cfg.commission_bps_per_side / 10_000.0
+    spread = cfg.spread_bps_round_trip / 10_000.0
+    slippage = 2.0 * cfg.slippage_bps_per_side / 10_000.0
+    borrow = 0.0
+    if side == "short":
+        borrow = cfg.short_borrow_apr * (cfg.horizon_bars / max(1, cfg.bars_per_year))
+    total = commission + spread + slippage + borrow
+    return {"commission": commission, "spread": spread, "slippage": slippage, "borrow": borrow, "total": total}
+
+
+def realized_net_return(row: pd.Series, side: str, cfg: Config) -> tuple[float, float, dict[str, float]]:
+    gross = realized_gross_return(row, side, cfg)
+    costs = backtest_costs(row, side, cfg)
+    net = gross - costs["total"]
+    return gross, net, costs
+
+
 def backtest(cfg: Config) -> dict[str, Any]:
     df = build_dataset(cfg)
     train_df, test_df = split_time(df)
     bundle = load_model(cfg)
     scored = score_frame(test_df, bundle)
     trades = []
+    skipped_no_fill = 0
     for _, row in scored.iterrows():
         long_ok = cfg.trade_direction in {"both", "long"} and row.long_score >= cfg.long_threshold and row.long_score > row.short_score and row.edge_gap >= cfg.min_edge_gap
         short_ok = cfg.trade_direction in {"both", "short"} and row.short_score >= cfg.short_threshold and row.short_score > row.long_score and row.edge_gap >= cfg.min_edge_gap
@@ -350,28 +436,53 @@ def backtest(cfg: Config) -> dict[str, Any]:
             long_ok = row.long_score >= cfg.long_threshold
         if cfg.trade_direction == "short":
             short_ok = row.short_score >= cfg.short_threshold
-        if long_ok:
-            trades.append({"timestamp": row.timestamp, "symbol": row.symbol, "side": "long", "return": realized_return(row, "long", cfg)})
-        elif short_ok:
-            trades.append({"timestamp": row.timestamp, "symbol": row.symbol, "side": "short", "return": realized_return(row, "short", cfg)})
+        side = "long" if long_ok else "short" if short_ok else None
+        if side is None:
+            continue
+        if not should_fill(row, side, cfg):
+            skipped_no_fill += 1
+            continue
+        gross, net, costs = realized_net_return(row, side, cfg)
+        trades.append({"timestamp": row.timestamp, "symbol": row.symbol, "side": side, "gross_return": gross, "return": net, **{f"cost_{k}": v for k, v in costs.items()}})
     if not trades:
-        return {"trades": 0, "note": "No trades with current thresholds."}
+        result = {"trades": 0, "skipped_no_fill": skipped_no_fill, "note": "No filled trades with current thresholds and fill filters."}
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return result
     t = pd.DataFrame(trades)
-    r = t["return"].clip(-0.08, 0.08)
-    eq = (1 + r).cumprod()
+    gross_r = t["gross_return"].clip(-0.08, 0.08)
+    net_r = t["return"].clip(-0.08, 0.08)
+    gross_eq = (1 + gross_r).cumprod()
+    net_eq = (1 + net_r).cumprod()
     result = {
         "symbols": list(cfg.symbols),
         "start_date": str(pd.Timestamp(scored["timestamp"].min()).date()),
         "end_date": str(pd.Timestamp(scored["timestamp"].max()).date()),
         "bars": int(scored["timestamp"].nunique()),
+        "signals_not_filled": int(skipped_no_fill),
         "trades": int(len(t)),
         "long_trades": int((t["side"] == "long").sum()),
         "short_trades": int((t["side"] == "short").sum()),
-        "win_rate": float((r > 0).mean()),
-        "avg_return": float(r.mean()),
-        "median_return": float(r.median()),
-        "total_compounded_return": float(eq.iloc[-1] - 1),
-        "max_drawdown": float((eq / eq.cummax() - 1).min()),
+        "win_rate": float((net_r > 0).mean()),
+        "avg_gross_return": float(gross_r.mean()),
+        "avg_net_return": float(net_r.mean()),
+        "median_net_return": float(net_r.median()),
+        "gross_compounded_return": float(gross_eq.iloc[-1] - 1),
+        "net_compounded_return": float(net_eq.iloc[-1] - 1),
+        "max_drawdown": float((net_eq / net_eq.cummax() - 1).min()),
+        "avg_total_cost": float(t["cost_total"].mean()),
+        "avg_spread_cost": float(t["cost_spread"].mean()),
+        "avg_slippage_cost": float(t["cost_slippage"].mean()),
+        "avg_commission_cost": float(t["cost_commission"].mean()),
+        "avg_borrow_cost": float(t["cost_borrow"].mean()),
+        "cost_model": {
+            "commission_bps_per_side": cfg.commission_bps_per_side,
+            "spread_bps_round_trip": cfg.spread_bps_round_trip,
+            "slippage_bps_per_side": cfg.slippage_bps_per_side,
+            "short_borrow_apr": cfg.short_borrow_apr,
+            "fill_probability": cfg.fill_probability,
+            "max_atr_pct_for_fill": cfg.max_atr_pct_for_fill,
+            "min_dollar_volume": cfg.min_dollar_volume,
+        },
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return result
