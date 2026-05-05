@@ -58,7 +58,6 @@ def low_dd_30m_status(
     oos_distance = abs(oos_monthly - TARGET_MONTHLY)
     wf_pass = float(wf.get("pass_rate", 0.0))
 
-    # Higher score wins. Lowest DD is the primary objective, closeness to 15% is next.
     score = (
         1_000_000.0
         - full_dd * 20_000.0
@@ -73,7 +72,8 @@ def low_dd_30m_status(
 def main() -> None:
     args = opt.parse_args()
     args.timeframe = "30m"
-    args.timeout_seconds = max(args.timeout_seconds, 18_000)
+    # Respect the workflow/user timeout. Do not force it back to 5 hours.
+    args.timeout_seconds = max(60, args.timeout_seconds)
     args.max_trials = max(args.max_trials, 6_000)
     args.min_monthly_return_pct = max(args.min_monthly_return_pct, 12.0)
     args.min_total_trades = max(args.min_total_trades, 120)
