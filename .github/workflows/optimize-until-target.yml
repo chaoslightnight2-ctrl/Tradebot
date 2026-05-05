@@ -2,6 +2,15 @@ name: Run max profit optimizer
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/optimize-until-target.yml'
+      - 'run_max_profit_optimizer.py'
+      - 'optimize_until_target.py'
+      - 'sontrade_bot.py'
+      - 'requirements.txt'
 
 jobs:
   optimize:
