@@ -1,6 +1,6 @@
 name: DD below monthly optimizer
 
-# Trigger refresh: run optimizer on optimize-risk-return pushes.
+# Runs the optimizer for the rule: abs(max_drawdown_pct) < monthly_return_pct.
 on:
   workflow_dispatch:
     inputs:
@@ -16,6 +16,14 @@ on:
         description: Maximum randomized trials before timeout
         required: true
         default: "1500"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "tools/optimize_dd_lt_monthly.py"
+      - ".github/workflows/dd_lt_monthly_optimizer.yml"
+      - "sontrade_bot.py"
+      - "requirements.txt"
   push:
     branches:
       - optimize-risk-return
