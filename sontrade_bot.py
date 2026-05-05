@@ -44,16 +44,51 @@ MODEL_PATH = APP_DIR / "sontrade_model.joblib"
 ENV_PATH = APP_DIR / ".env"
 
 FEATURES = [
-    "ret_1", "ret_3", "ret_5", "ret_10", "ret_20", "ema12_dist", "ema26_dist",
-    "ema200_dist", "rsi14", "atr_pct", "vol_z20", "range_pct", "breakout20",
-    "drawdown20", "market_ret_5", "rel_ret_spy_5", "rel_ret_spy_20",
+    # Price momentum
+    "ret_1", "ret_3", "ret_5", "ret_10", "ret_20", "ret_60",
+    "ema12_dist", "ema26_dist", "ema200_dist",
+
+    # MACD + trend quality
+    "macd_hist_pct", "macd_line_pct", "macd_signal_pct", "trend_quality", "ema_slope_20",
+
+    # VWAP
+    "vwap_dist", "vwap_slope_5",
+
+    # Oscillator / volatility
+    "rsi14", "atr_pct", "range_pct",
+
+    # Bollinger Band
+    "bb_position", "bb_width", "bb_squeeze", "bb_upper_dist", "bb_lower_dist",
+
+    # Gap
+    "gap_pct", "gap_abs",
+
+    # ADX / directional movement
+    "adx14", "plus_di", "minus_di", "di_spread",
+
+    # Volume confirmation
+    "vol_z20", "relative_volume_20", "dollar_volume_z20", "obv_change_5", "volume_price_trend_5",
+
+    # Breakout / drawdown
+    "breakout20", "breakout55", "drawdown20", "proximity_high_252",
+
+    # Opening range, useful on intraday data; zeroed on daily data.
+    "opening_range_breakout", "opening_range_breakdown",
+
+    # Market regime
+    "spy_ret_5", "spy_ret_20", "spy_ema200_dist", "spy_trend_up",
+    "qqq_ret_5", "qqq_ret_20", "qqq_ema200_dist", "qqq_trend_up",
+    "market_regime_score",
+
+    # Relative strength
+    "rel_ret_spy_5", "rel_ret_spy_20", "rel_ret_qqq_5", "rel_ret_qqq_20",
 ]
 
 
 @dataclass(frozen=True)
 class Config:
     symbols: tuple[str, ...] = ("AAPL",)
-    benchmark: str = "SPY"
+    benchmark_symbols: tuple[str, ...] = ("SPY", "QQQ")
     timeframe: str = "1Day"
     lookback_days: int = 2500
     data_provider: str = "yfinance"
@@ -94,11 +129,17 @@ def load_dotenv(path: Path = ENV_PATH) -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
+def parse_symbols(raw: str) -> tuple[str, ...]:
+    return tuple(s.strip().upper() for s in raw.split(",") if s.strip())
+
+
 def load_config() -> Config:
-    symbols = tuple(s.strip().upper() for s in os.getenv("ALPACA_SYMBOLS", "AAPL").split(",") if s.strip())
+    symbols = parse_symbols(os.getenv("ALPACA_SYMBOLS", "AAPL"))
+    benchmark_raw = os.getenv("SONTRADE_BENCHMARK_SYMBOLS", os.getenv("SONTRADE_BENCHMARK", "SPY,QQQ"))
+    benchmarks = parse_symbols(benchmark_raw) or ("SPY", "QQQ")
     return Config(
         symbols=symbols or ("AAPL",),
-        benchmark=os.getenv("SONTRADE_BENCHMARK", "SPY").strip().upper(),
+        benchmark_symbols=benchmarks,
         timeframe=os.getenv("ALPACA_TIMEFRAME", "1Day"),
         lookback_days=int(os.getenv("SONTRADE_LOOKBACK_DAYS", "2500")),
         data_provider=os.getenv("SONTRADE_DATA_PROVIDER", "yfinance").strip().lower(),
@@ -154,6 +195,10 @@ def parse_timeframe(value: str) -> TimeFrame:
     raise ValueError(f"Unsupported timeframe: {value}")
 
 
+def timeframe_is_daily(value: str) -> bool:
+    return value.strip().lower() in {"1d", "1day", "day"}
+
+
 def yf_interval(timeframe: str) -> str:
     clean = timeframe.strip().lower()
     if clean in {"1d", "1day", "day"}:
@@ -178,6 +223,10 @@ def require_keys() -> tuple[str, str]:
 def alpaca_clients() -> tuple[TradingClient, StockHistoricalDataClient]:
     key, secret = require_keys()
     return TradingClient(key, secret, paper=True), StockHistoricalDataClient(key, secret)
+
+
+def feature_universe(cfg: Config) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(list(cfg.symbols) + list(cfg.benchmark_symbols)))
 
 
 def fetch_yfinance(symbols: tuple[str, ...], cfg: Config) -> pd.DataFrame:
@@ -234,7 +283,7 @@ def fetch_alpaca(symbols: tuple[str, ...], cfg: Config) -> pd.DataFrame:
 
 
 def fetch_bars(cfg: Config) -> pd.DataFrame:
-    universe = tuple(dict.fromkeys(list(cfg.symbols) + [cfg.benchmark]))
+    universe = feature_universe(cfg)
     if cfg.data_provider == "alpaca":
         return fetch_alpaca(universe, cfg)
     return fetch_yfinance(universe, cfg)
@@ -252,49 +301,221 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - 100 / (1 + rs)
 
 
+def add_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr_w = tr.ewm(alpha=1 / period, adjust=False).mean().replace(0, np.nan)
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_w
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False).mean() / atr_w
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1 / period, adjust=False).mean()
+
+    df["adx14"] = (adx / 100).clip(0, 1)
+    df["plus_di"] = (plus_di / 100).clip(0, 1)
+    df["minus_di"] = (minus_di / 100).clip(0, 1)
+    df["di_spread"] = ((plus_di - minus_di) / 100).clip(-1, 1)
+    return df
+
+
+def add_opening_range_features(df: pd.DataFrame, daily: bool) -> pd.DataFrame:
+    if daily:
+        df["opening_range_breakout"] = 0.0
+        df["opening_range_breakdown"] = 0.0
+        return df
+
+    out = df.copy()
+    session = out["timestamp"].dt.strftime("%Y-%m-%d")
+    bar_no = out.groupby(session).cumcount()
+    opening_mask = bar_no < 2
+    opening_high = out["high"].where(opening_mask).groupby(session).transform("max")
+    opening_low = out["low"].where(opening_mask).groupby(session).transform("min")
+    opening_high = opening_high.groupby(session).ffill()
+    opening_low = opening_low.groupby(session).ffill()
+
+    close = out["close"].astype(float)
+    out["opening_range_breakout"] = close / opening_high.replace(0, np.nan) - 1
+    out["opening_range_breakdown"] = close / opening_low.replace(0, np.nan) - 1
+    out[["opening_range_breakout", "opening_range_breakdown"]] = out[["opening_range_breakout", "opening_range_breakdown"]].fillna(0.0)
+    return out
+
+
+def add_symbol_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    df = df.sort_values("timestamp").copy()
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    open_ = df["open"].astype(float)
+    volume = df["volume"].astype(float)
+    prev_close = close.shift(1)
+
+    ema12 = ema(close, 12)
+    ema26 = ema(close, 26)
+    ema200 = ema(close, 200)
+
+    macd_line = ema12 - ema26
+    macd_signal = ema(macd_line, 9)
+    macd_hist = macd_line - macd_signal
+
+    true_range = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    atr = true_range.rolling(14).mean()
+
+    typical = (open_ + high + low + close) / 4
+    dollar_volume = close * volume
+    if timeframe_is_daily(cfg.timeframe):
+        vwap = (typical * volume).rolling(20).sum() / volume.rolling(20).sum().replace(0, np.nan)
+    else:
+        session = df["timestamp"].dt.strftime("%Y-%m-%d")
+        vwap = (typical * volume).groupby(session).cumsum() / volume.groupby(session).cumsum().replace(0, np.nan)
+
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    bb_upper = bb_mid + 2 * bb_std
+    bb_lower = bb_mid - 2 * bb_std
+    bb_den = (bb_upper - bb_lower).replace(0, np.nan)
+
+    obv = (np.sign(close.diff()).fillna(0) * volume).cumsum()
+    vol20_sum = volume.rolling(20).sum().replace(0, np.nan)
+    volume_mean20 = volume.rolling(20).mean()
+    volume_std20 = volume.rolling(20).std().replace(0, np.nan)
+    dollar_log = np.log1p(dollar_volume)
+
+    df["ret_1"] = close.pct_change(1)
+    df["ret_3"] = close.pct_change(3)
+    df["ret_5"] = close.pct_change(5)
+    df["ret_10"] = close.pct_change(10)
+    df["ret_20"] = close.pct_change(20)
+    df["ret_60"] = close.pct_change(60)
+
+    df["ema12_dist"] = close / ema12 - 1
+    df["ema26_dist"] = close / ema26 - 1
+    df["ema200_dist"] = close / ema200 - 1
+    df["ema_slope_20"] = ema26.pct_change(20)
+
+    df["macd_hist_pct"] = macd_hist / close
+    df["macd_line_pct"] = macd_line / close
+    df["macd_signal_pct"] = macd_signal / close
+    df["trend_quality"] = ((ema12 / ema26 - 1) * np.sign(df["ret_5"])).fillna(0.0)
+
+    df["vwap_dist"] = close / vwap - 1
+    df["vwap_slope_5"] = vwap.pct_change(5)
+
+    df["rsi14"] = (rsi(close, 14) - 50) / 50
+    df["atr_pct"] = atr / close
+    df["range_pct"] = (high - low) / close
+
+    df["bb_position"] = ((close - bb_lower) / bb_den - 0.5).clip(-2, 2)
+    df["bb_width"] = bb_den / close
+    df["bb_squeeze"] = df["bb_width"] / df["bb_width"].rolling(120).mean() - 1
+    df["bb_upper_dist"] = close / bb_upper - 1
+    df["bb_lower_dist"] = close / bb_lower - 1
+
+    df["gap_pct"] = open_ / prev_close - 1
+    df["gap_abs"] = df["gap_pct"].abs()
+
+    df["vol_z20"] = (volume - volume_mean20) / volume_std20
+    df["relative_volume_20"] = volume / volume_mean20.replace(0, np.nan) - 1
+    df["dollar_volume"] = dollar_volume
+    df["dollar_volume_z20"] = (dollar_log - dollar_log.rolling(20).mean()) / dollar_log.rolling(20).std().replace(0, np.nan)
+    df["obv_change_5"] = obv.diff(5) / vol20_sum
+    df["volume_price_trend_5"] = (df["ret_1"] * volume).rolling(5).sum() / volume_mean20.replace(0, np.nan)
+
+    df["breakout20"] = close / high.shift(1).rolling(20).max() - 1
+    df["breakout55"] = close / high.shift(1).rolling(55).max() - 1
+    df["drawdown20"] = close / close.rolling(20).max() - 1
+    df["proximity_high_252"] = close / high.rolling(252).max() - 1
+
+    df = add_adx(df)
+    df = add_opening_range_features(df, daily=timeframe_is_daily(cfg.timeframe))
+
+    future_return = close.shift(-cfg.horizon_bars) / close - 1
+    df["future_return"] = future_return
+    df["future_high_max"] = high.shift(-1).rolling(cfg.horizon_bars, min_periods=cfg.horizon_bars).max()
+    df["future_low_min"] = low.shift(-1).rolling(cfg.horizon_bars, min_periods=cfg.horizon_bars).min()
+    df["long_target"] = (future_return > cfg.label_threshold).astype(int)
+    df["short_target"] = ((-future_return) > cfg.label_threshold).astype(int)
+    return df
+
+
+def add_market_context(features: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    out = features.sort_values(["symbol", "timestamp"]).copy()
+
+    for col in [
+        "spy_ret_5", "spy_ret_20", "spy_ema200_dist", "spy_trend_up",
+        "qqq_ret_5", "qqq_ret_20", "qqq_ema200_dist", "qqq_trend_up",
+        "rel_ret_spy_5", "rel_ret_spy_20", "rel_ret_qqq_5", "rel_ret_qqq_20",
+        "market_regime_score",
+    ]:
+        out[col] = 0.0
+
+    bench_specs = []
+    for symbol in cfg.benchmark_symbols:
+        prefix = symbol.lower()
+        if symbol == "SPY":
+            prefix = "spy"
+        elif symbol == "QQQ":
+            prefix = "qqq"
+        bench_specs.append((symbol, prefix))
+
+    trend_cols: list[str] = []
+    for symbol, prefix in bench_specs:
+        bench = out[out["symbol"] == symbol]
+        if bench.empty:
+            continue
+        ctx = bench[["timestamp", "ret_5", "ret_20", "ema200_dist"]].rename(
+            columns={
+                "ret_5": f"{prefix}_ret_5",
+                "ret_20": f"{prefix}_ret_20",
+                "ema200_dist": f"{prefix}_ema200_dist",
+            }
+        )
+        out = out.merge(ctx, on="timestamp", how="left", suffixes=("", "_ctx"))
+
+        for col in [f"{prefix}_ret_5", f"{prefix}_ret_20", f"{prefix}_ema200_dist"]:
+            ctx_col = f"{col}_ctx"
+            if ctx_col in out.columns:
+                out[col] = out[ctx_col].fillna(out.get(col, 0.0)).fillna(0.0)
+                out = out.drop(columns=[ctx_col])
+
+        trend_col = f"{prefix}_trend_up"
+        if f"{prefix}_ema200_dist" in out.columns:
+            out[trend_col] = (out[f"{prefix}_ema200_dist"] > 0).astype(float)
+            trend_cols.append(trend_col)
+
+        if prefix in {"spy", "qqq"}:
+            out[f"rel_ret_{prefix}_5"] = out["ret_5"] - out[f"{prefix}_ret_5"]
+            out[f"rel_ret_{prefix}_20"] = out["ret_20"] - out[f"{prefix}_ret_20"]
+
+    if trend_cols:
+        out["market_regime_score"] = out[trend_cols].mean(axis=1)
+
+    return out
+
+
 def add_features(raw: pd.DataFrame, cfg: Config, require_targets: bool = True) -> pd.DataFrame:
     frames = []
-    for symbol, df in raw.groupby("symbol", sort=False):
-        df = df.sort_values("timestamp").copy()
-        c = df["close"].astype(float)
-        h = df["high"].astype(float)
-        l = df["low"].astype(float)
-        v = df["volume"].astype(float)
-        prev = c.shift(1)
-        tr = pd.concat([(h - l), (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
-        atr = tr.rolling(14).mean()
-        df["ret_1"] = c.pct_change(1)
-        df["ret_3"] = c.pct_change(3)
-        df["ret_5"] = c.pct_change(5)
-        df["ret_10"] = c.pct_change(10)
-        df["ret_20"] = c.pct_change(20)
-        df["ema12_dist"] = c / ema(c, 12) - 1
-        df["ema26_dist"] = c / ema(c, 26) - 1
-        df["ema200_dist"] = c / ema(c, 200) - 1
-        df["rsi14"] = (rsi(c, 14) - 50) / 50
-        df["atr_pct"] = atr / c
-        df["vol_z20"] = (v - v.rolling(20).mean()) / v.rolling(20).std().replace(0, np.nan)
-        df["dollar_volume"] = c * v
-        df["range_pct"] = (h - l) / c
-        df["breakout20"] = c / h.shift(1).rolling(20).max() - 1
-        df["drawdown20"] = c / c.rolling(20).max() - 1
-        fut = c.shift(-cfg.horizon_bars) / c - 1
-        df["future_return"] = fut
-        df["future_high_max"] = h.shift(-1).rolling(cfg.horizon_bars, min_periods=cfg.horizon_bars).max()
-        df["future_low_min"] = l.shift(-1).rolling(cfg.horizon_bars, min_periods=cfg.horizon_bars).min()
-        df["long_target"] = (fut > cfg.label_threshold).astype(int)
-        df["short_target"] = ((-fut) > cfg.label_threshold).astype(int)
-        frames.append(df)
+    for _, df in raw.groupby("symbol", sort=False):
+        frames.append(add_symbol_features(df, cfg))
+
     out = pd.concat(frames, ignore_index=True)
-    bench = out[out["symbol"] == cfg.benchmark][["timestamp", "ret_5", "ret_20"]].rename(columns={"ret_5": "market_ret_5", "ret_20": "market_ret_20"})
-    out = out.merge(bench, on="timestamp", how="left")
-    out["market_ret_5"] = out["market_ret_5"].fillna(0)
-    out["rel_ret_spy_5"] = out["ret_5"] - out["market_ret_5"]
-    out["rel_ret_spy_20"] = out["ret_20"] - out["market_ret_20"].fillna(0)
+    out = add_market_context(out, cfg)
     out = out[out["symbol"].isin(cfg.symbols)].copy()
-    cols = FEATURES + (["future_return", "future_high_max", "future_low_min"] if require_targets else [])
+
+    for col in FEATURES:
+        if col not in out.columns:
+            out[col] = 0.0
+
     out[FEATURES] = out[FEATURES].replace([np.inf, -np.inf], np.nan)
-    return out.dropna(subset=cols).reset_index(drop=True)
+    required = FEATURES + (["future_return", "future_high_max", "future_low_min"] if require_targets else [])
+    return out.dropna(subset=required).reset_index(drop=True)
 
 
 def build_dataset(cfg: Config, require_targets: bool = True) -> pd.DataFrame:
@@ -309,8 +530,8 @@ def split_time(df: pd.DataFrame, frac: float = 0.78) -> tuple[pd.DataFrame, pd.D
 
 def make_model(cfg: Config) -> RandomForestClassifier:
     return RandomForestClassifier(
-        n_estimators=350,
-        max_depth=6,
+        n_estimators=450,
+        max_depth=7,
         min_samples_leaf=8,
         class_weight="balanced_subsample",
         random_state=cfg.random_seed,
@@ -323,13 +544,21 @@ def train(cfg: Config) -> dict[str, Any]:
     train_df, test_df = split_time(df)
     long_model = make_model(cfg).fit(train_df[FEATURES], train_df["long_target"])
     short_model = make_model(cfg).fit(train_df[FEATURES], train_df["short_target"])
-    bundle = {"long_model": long_model, "short_model": short_model, "features": FEATURES, "config": asdict(cfg), "trained_at": utc_now().isoformat()}
+    bundle = {
+        "long_model": long_model,
+        "short_model": short_model,
+        "features": FEATURES,
+        "config": asdict(cfg),
+        "trained_at": utc_now().isoformat(),
+    }
     joblib.dump(bundle, MODEL_PATH)
     scored = score_frame(test_df, bundle)
     metrics = {
         "rows": len(df),
         "train_rows": len(train_df),
         "test_rows": len(test_df),
+        "feature_count": len(FEATURES),
+        "features": FEATURES,
         "long": model_metrics(test_df["long_target"], scored["long_score"]),
         "short": model_metrics(test_df["short_target"], scored["short_score"]),
     }
@@ -339,7 +568,11 @@ def train(cfg: Config) -> dict[str, Any]:
 
 def model_metrics(y: pd.Series, p: pd.Series) -> dict[str, float]:
     pred = (p >= 0.5).astype(int)
-    out = {"base_rate": float(y.mean()), "accuracy": float(accuracy_score(y, pred)), "precision": float(precision_score(y, pred, zero_division=0))}
+    out = {
+        "base_rate": float(y.mean()),
+        "accuracy": float(accuracy_score(y, pred)),
+        "precision": float(precision_score(y, pred, zero_division=0)),
+    }
     if y.nunique() > 1:
         out["roc_auc"] = float(roc_auc_score(y, p))
     return out
@@ -348,13 +581,19 @@ def model_metrics(y: pd.Series, p: pd.Series) -> dict[str, float]:
 def load_model(cfg: Config) -> dict[str, Any]:
     if not MODEL_PATH.exists():
         train(cfg)
-    return joblib.load(MODEL_PATH)
+    bundle = joblib.load(MODEL_PATH)
+    if bundle.get("features") != FEATURES:
+        logging.info("Model feature list changed; retraining model.")
+        train(cfg)
+        bundle = joblib.load(MODEL_PATH)
+    return bundle
 
 
 def score_frame(df: pd.DataFrame, bundle: dict[str, Any]) -> pd.DataFrame:
     out = df.copy()
-    out["long_score"] = bundle["long_model"].predict_proba(out[FEATURES])[:, 1]
-    out["short_score"] = bundle["short_model"].predict_proba(out[FEATURES])[:, 1]
+    features = bundle.get("features", FEATURES)
+    out["long_score"] = bundle["long_model"].predict_proba(out[features])[:, 1]
+    out["short_score"] = bundle["short_model"].predict_proba(out[features])[:, 1]
     out["edge_gap"] = (out["long_score"] - out["short_score"]).abs()
     return out
 
@@ -424,11 +663,12 @@ def realized_net_return(row: pd.Series, side: str, cfg: Config) -> tuple[float, 
 
 def backtest(cfg: Config) -> dict[str, Any]:
     df = build_dataset(cfg)
-    train_df, test_df = split_time(df)
+    _, test_df = split_time(df)
     bundle = load_model(cfg)
     scored = score_frame(test_df, bundle)
     trades = []
     skipped_no_fill = 0
+
     for _, row in scored.iterrows():
         long_ok = cfg.trade_direction in {"both", "long"} and row.long_score >= cfg.long_threshold and row.long_score > row.short_score and row.edge_gap >= cfg.min_edge_gap
         short_ok = cfg.trade_direction in {"both", "short"} and row.short_score >= cfg.short_threshold and row.short_score > row.long_score and row.edge_gap >= cfg.min_edge_gap
@@ -436,18 +676,29 @@ def backtest(cfg: Config) -> dict[str, Any]:
             long_ok = row.long_score >= cfg.long_threshold
         if cfg.trade_direction == "short":
             short_ok = row.short_score >= cfg.short_threshold
+
         side = "long" if long_ok else "short" if short_ok else None
         if side is None:
             continue
         if not should_fill(row, side, cfg):
             skipped_no_fill += 1
             continue
+
         gross, net, costs = realized_net_return(row, side, cfg)
-        trades.append({"timestamp": row.timestamp, "symbol": row.symbol, "side": side, "gross_return": gross, "return": net, **{f"cost_{k}": v for k, v in costs.items()}})
+        trades.append({
+            "timestamp": row.timestamp,
+            "symbol": row.symbol,
+            "side": side,
+            "gross_return": gross,
+            "return": net,
+            **{f"cost_{k}": v for k, v in costs.items()},
+        })
+
     if not trades:
         result = {"trades": 0, "skipped_no_fill": skipped_no_fill, "note": "No filled trades with current thresholds and fill filters."}
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return result
+
     t = pd.DataFrame(trades)
     gross_r = t["gross_return"].clip(-0.08, 0.08)
     net_r = t["return"].clip(-0.08, 0.08)
@@ -458,6 +709,7 @@ def backtest(cfg: Config) -> dict[str, Any]:
         "start_date": str(pd.Timestamp(scored["timestamp"].min()).date()),
         "end_date": str(pd.Timestamp(scored["timestamp"].max()).date()),
         "bars": int(scored["timestamp"].nunique()),
+        "feature_count": len(FEATURES),
         "signals_not_filled": int(skipped_no_fill),
         "trades": int(len(t)),
         "long_trades": int((t["side"] == "long").sum()),
@@ -483,6 +735,7 @@ def backtest(cfg: Config) -> dict[str, Any]:
             "max_atr_pct_for_fill": cfg.max_atr_pct_for_fill,
             "min_dollar_volume": cfg.min_dollar_volume,
         },
+        "features": FEATURES,
     }
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return result
@@ -526,6 +779,7 @@ def trade_once(cfg: Config) -> pd.DataFrame:
     if not clock.is_open:
         logging.info("Market is closed. Next open: %s", clock.next_open)
         return pd.DataFrame()
+
     account = trading.get_account()
     equity = float(account.equity)
     positions = {p.symbol.upper() for p in trading.get_all_positions()}
@@ -534,6 +788,7 @@ def trade_once(cfg: Config) -> pd.DataFrame:
     except Exception:
         orders = set()
     blocked = positions | orders
+
     scored = latest_score(cfg)
     sent = []
     for _, row in scored.iterrows():
@@ -543,10 +798,12 @@ def trade_once(cfg: Config) -> pd.DataFrame:
         decision = str(row.decision)
         if decision == "hold" or symbol in blocked:
             continue
+
         price = float(row.close)
         qty = position_size(equity, price, float(row.atr_pct), cfg)
         if qty <= 0:
             continue
+
         stop_pct = min(cfg.max_stop_pct, max(cfg.min_stop_pct, float(row.atr_pct) * cfg.stop_atr_mult))
         tp_pct = stop_pct * cfg.tp_r
         if decision == "long":
@@ -557,7 +814,16 @@ def trade_once(cfg: Config) -> pd.DataFrame:
             side = OrderSide.SELL
             tp = round_price(price * (1 - tp_pct))
             sl = round_price(price * (1 + stop_pct))
-        order = MarketOrderRequest(symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET, take_profit=TakeProfitRequest(limit_price=tp), stop_loss=StopLossRequest(stop_price=sl))
+
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            time_in_force=TimeInForce.DAY,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=tp),
+            stop_loss=StopLossRequest(stop_price=sl),
+        )
         res = trading.submit_order(order_data=order)
         sent.append({"symbol": symbol, "decision": decision, "qty": qty, "tp": tp, "sl": sl, "order_id": str(res.id)})
     return pd.DataFrame(sent)
@@ -592,6 +858,7 @@ def main() -> int:
     setup_logging(args.verbose)
     cfg = load_config()
     logging.info("Config: %s", json.dumps(asdict(cfg), ensure_ascii=False))
+
     if args.mode == "train":
         train(cfg)
     elif args.mode == "backtest":
