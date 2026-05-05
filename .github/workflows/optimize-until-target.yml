@@ -1,0 +1,77 @@
+name: Optimize until target
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_monthly:
+        description: 'Target monthly return percent'
+        required: true
+        default: '15'
+      max_dd:
+        description: 'Max drawdown percent'
+        required: true
+        default: '10'
+      timeout_hours:
+        description: 'Timeout hours'
+        required: true
+        default: '3'
+      max_trials:
+        description: 'Optional max trials, 0 means until timeout/target'
+        required: true
+        default: '0'
+      verify_runs:
+        description: 'Verification backtest runs for best model'
+        required: true
+        default: '3'
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 190
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Syntax check
+        run: |
+          python -m py_compile sontrade_bot.py optimize_until_target.py explain_scores.py
+      - name: Run optimizer
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER: 'true'
+          ALPACA_SYMBOLS: AAPL
+          SONTRADE_BENCHMARK_SYMBOLS: SPY,QQQ
+          SONTRADE_DATA_PROVIDER: yfinance
+          ALPACA_TIMEFRAME: 1Day
+          SONTRADE_LOOKBACK_DAYS: 2500
+        run: |
+          python optimize_until_target.py \
+            --target-monthly "${{ github.event.inputs.target_monthly }}" \
+            --max-dd "${{ github.event.inputs.max_dd }}" \
+            --timeout-hours "${{ github.event.inputs.timeout_hours }}" \
+            --max-trials "${{ github.event.inputs.max_trials }}" \
+            --verify-runs "${{ github.event.inputs.verify_runs }}" \
+            --quiet
+      - name: Print best settings
+        if: always()
+        run: |
+          ls -la
+          test -f sonayarlar.json && cat sonayarlar.json || true
+          test -f sonayarlar.env && cat sonayarlar.env || true
+      - name: Upload optimizer outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonayarlar
+          path: |
+            sonayarlar.json
+            sonayarlar.env
+            sontrade_model_best.joblib
+            sontrade_model.joblib
+          if-no-files-found: warn
