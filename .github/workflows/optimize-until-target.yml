@@ -1,28 +1,7 @@
-name: Optimize until target
+name: Run max profit optimizer
 
 on:
   workflow_dispatch:
-    inputs:
-      target_monthly:
-        description: 'Target monthly return percent'
-        required: true
-        default: '15'
-      max_dd:
-        description: 'Max drawdown percent'
-        required: true
-        default: '10'
-      timeout_hours:
-        description: 'Timeout hours'
-        required: true
-        default: '3'
-      max_trials:
-        description: 'Optional max trials, 0 means until timeout/target'
-        required: true
-        default: '0'
-      verify_runs:
-        description: 'Verification backtest runs for best model'
-        required: true
-        default: '3'
 
 jobs:
   optimize:
@@ -39,8 +18,8 @@ jobs:
           pip install -r requirements.txt
       - name: Syntax check
         run: |
-          python -m py_compile sontrade_bot.py optimize_until_target.py explain_scores.py
-      - name: Run optimizer
+          python -m py_compile sontrade_bot.py optimize_until_target.py explain_scores.py run_max_profit_optimizer.py
+      - name: Run zero-input max-profit optimizer
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
@@ -51,13 +30,7 @@ jobs:
           ALPACA_TIMEFRAME: 1Day
           SONTRADE_LOOKBACK_DAYS: 2500
         run: |
-          python optimize_until_target.py \
-            --target-monthly "${{ github.event.inputs.target_monthly }}" \
-            --max-dd "${{ github.event.inputs.max_dd }}" \
-            --timeout-hours "${{ github.event.inputs.timeout_hours }}" \
-            --max-trials "${{ github.event.inputs.max_trials }}" \
-            --verify-runs "${{ github.event.inputs.verify_runs }}" \
-            --quiet
+          python run_max_profit_optimizer.py
       - name: Print best settings
         if: always()
         run: |
