@@ -14,13 +14,14 @@ on:
       max_trials:
         description: Maximum randomized trials before timeout
         required: true
-        default: "5000"
+        default: "6000"
   push:
     branches:
       - main
     paths:
       - "tools/optimize_dd_lt_monthly.py"
       - "tools/optimize_monthly15_lowdd.py"
+      - "tools/optimize_30m_monthly15_lowdd.py"
       - ".github/workflows/dd_lt_monthly_optimizer.yml"
       - "sontrade_bot.py"
       - "requirements.txt"
@@ -45,16 +46,21 @@ jobs:
 
       - name: Run optimizer
         env:
-          SONTRADE_DATA_PROVIDER: yfinance
+          SONTRADE_DATA_PROVIDER: alpaca
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
-          python tools/optimize_monthly15_lowdd.py \
+          python tools/optimize_30m_monthly15_lowdd.py \
             --symbols "${{ github.event.inputs.symbols || 'AAPL' }}" \
+            --data-provider alpaca \
+            --timeframe 30m \
             --lookback-days 2500 \
             --timeout-seconds "${{ github.event.inputs.timeout_seconds || '18000' }}" \
-            --max-trials "${{ github.event.inputs.max_trials || '5000' }}" \
-            --min-monthly-return-pct 15 \
-            --min-total-trades 80 \
-            --min-oos-trades 30
+            --max-trials "${{ github.event.inputs.max_trials || '6000' }}" \
+            --min-monthly-return-pct 12 \
+            --min-total-trades 120 \
+            --min-oos-trades 40 \
+            --bars-per-year 3276
 
       - name: Show final report
         if: always()
@@ -67,7 +73,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: monthly15-lowdd-optimizer-reports
+          name: optimizer-30m-monthly15-lowdd-reports
           path: |
             reports/dd_lt_monthly_optimizer_trials.jsonl
             reports/dd_lt_monthly_valid_candidates.json
