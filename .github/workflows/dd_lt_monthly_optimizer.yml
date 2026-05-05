@@ -1,0 +1,75 @@
+name: DD below monthly optimizer
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: Symbols to optimize
+        required: true
+        default: AAPL
+      timeout_seconds:
+        description: Optimizer timeout seconds
+        required: true
+        default: "7200"
+      max_trials:
+        description: Maximum randomized trials before timeout
+        required: true
+        default: "1500"
+  push:
+    branches:
+      - optimize-risk-return
+    paths:
+      - "tools/optimize_dd_lt_monthly.py"
+      - ".github/workflows/dd_lt_monthly_optimizer.yml"
+      - "sontrade_bot.py"
+      - "requirements.txt"
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run optimizer
+        env:
+          SONTRADE_DATA_PROVIDER: yfinance
+        run: |
+          python tools/optimize_dd_lt_monthly.py \
+            --symbols "${{ github.event.inputs.symbols || 'AAPL' }}" \
+            --lookback-days 2500 \
+            --timeout-seconds "${{ github.event.inputs.timeout_seconds || '7200' }}" \
+            --max-trials "${{ github.event.inputs.max_trials || '1500' }}" \
+            --min-monthly-return-pct 5 \
+            --min-total-trades 80 \
+            --min-oos-trades 30
+
+      - name: Show final report
+        if: always()
+        run: |
+          if [ -f reports/DD_LT_MONTHLY_OPTIMIZER_REPORT.md ]; then
+            cat reports/DD_LT_MONTHLY_OPTIMIZER_REPORT.md
+          fi
+
+      - name: Upload optimizer reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dd-lt-monthly-optimizer-reports
+          path: |
+            reports/dd_lt_monthly_optimizer_trials.jsonl
+            reports/dd_lt_monthly_valid_candidates.json
+            reports/dd_lt_monthly_best_config.json
+            reports/DD_LT_MONTHLY_OPTIMIZER_REPORT.md
+          if-no-files-found: warn
