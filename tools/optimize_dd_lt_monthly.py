@@ -133,3 +133,102 @@ def train_bundle(train_df: pd.DataFrame, cfg: Config) -> dict[str, Any]:
         "config": asdict(cfg),
         "trained_at": datetime.now(UTC).isoformat(),
     }
+
+
+def select_trades(scored: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for _, row in scored.sort_values("timestamp").iterrows():
+        long_score = safe_float(row.get("long_score"))
+        short_score = safe_float(row.get("short_score"))
+        edge_gap = abs(long_score - short_score)
+        side: str | None = None
+        if cfg.trade_direction in {"long", "both"} and long_score >= cfg.long_threshold and edge_gap >= cfg.min_edge_gap:
+            side = "long"
+        if cfg.trade_direction in {"short", "both"} and short_score >= cfg.short_threshold and edge_gap >= cfg.min_edge_gap:
+            if side is None or short_score > long_score:
+                side = "short"
+        if side is None or not should_fill(row, side, cfg):
+            continue
+        gross = realized_gross_return(row, side, cfg)
+        costs = backtest_costs(row, side, cfg)
+        net = gross - costs["total_cost"]
+        atr_stop = safe_float(row.get("atr_pct")) * cfg.stop_atr_mult
+        stop_pct = max(cfg.min_stop_pct, min(cfg.max_stop_pct, atr_stop))
+        position_return = net * cfg.risk_per_trade / stop_pct
+        rows.append({
+            "timestamp": str(row["timestamp"]),
+            "symbol": row.get("symbol"),
+            "side": side,
+            "gross_return": gross,
+            "net_return": net,
+            "position_return": position_return,
+            "long_score": long_score,
+            "short_score": short_score,
+            "edge_gap": edge_gap,
+        })
+    return pd.DataFrame(rows)
+
+
+def metrics_from_trades(trades: pd.DataFrame, start_ts: Any, end_ts: Any, min_monthly_return_pct: float) -> dict[str, Any]:
+    if trades.empty or start_ts is None or end_ts is None:
+        return {
+            "trade_count": 0, "long_trades": 0, "short_trades": 0,
+            "win_rate_pct": 0.0, "total_return_pct": 0.0, "monthly_return_pct": 0.0,
+            "max_drawdown_pct": 0.0, "profit_factor": 0.0, "expectancy_pct": 0.0,
+            "dd_to_monthly_ratio": None, "passes_dd_lt_monthly": False, "passes_min_monthly": False,
+        }
+    r = trades["position_return"].astype(float).clip(lower=-0.95)
+    equity = (1.0 + r).cumprod()
+    max_dd = ((equity / equity.cummax()) - 1.0).min()
+    total_return = equity.iloc[-1] - 1.0
+    start = pd.to_datetime(start_ts)
+    end = pd.to_datetime(end_ts)
+    months = max(1.0 / 30.4375, (end - start).days / 30.4375)
+    monthly_return = (1.0 + total_return) ** (1.0 / months) - 1.0 if total_return > -0.999 else -1.0
+    wins = r[r > 0]
+    losses = r[r < 0]
+    monthly_pct = pct(monthly_return)
+    dd_pct = pct(max_dd)
+    ratio = abs(dd_pct) / monthly_pct if monthly_pct > 0 else None
+    return {
+        "trade_count": int(len(trades)),
+        "long_trades": int((trades["side"] == "long").sum()),
+        "short_trades": int((trades["side"] == "short").sum()),
+        "win_rate_pct": round(float((r > 0).mean() * 100.0), 6),
+        "total_return_pct": pct(total_return),
+        "monthly_return_pct": monthly_pct,
+        "max_drawdown_pct": dd_pct,
+        "profit_factor": round(float(wins.sum() / abs(losses.sum())), 6) if abs(losses.sum()) > 0 else None,
+        "expectancy_pct": pct(r.mean()),
+        "dd_to_monthly_ratio": round(float(ratio), 6) if ratio is not None else None,
+        "passes_dd_lt_monthly": bool(monthly_pct > 0 and abs(dd_pct) < monthly_pct),
+        "passes_min_monthly": bool(monthly_pct > min_monthly_return_pct),
+    }
+
+
+def evaluate(scored: pd.DataFrame, cfg: Config, min_monthly_return_pct: float) -> dict[str, Any]:
+    if scored.empty:
+        return metrics_from_trades(pd.DataFrame(), None, None, min_monthly_return_pct)
+    trades = select_trades(scored, cfg)
+    return metrics_from_trades(trades, scored["timestamp"].min(), scored["timestamp"].max(), min_monthly_return_pct)
+
+
+def walk_forward(df: pd.DataFrame, cfg: Config, args: argparse.Namespace) -> dict[str, Any]:
+    times = sorted(pd.to_datetime(df["timestamp"]).unique())
+    windows: list[dict[str, Any]] = []
+    n = args.wf_train_bars + args.wf_test_bars
+    if len(times) < n:
+        return {"window_count": 0, "pass_rate": 0.0, "windows": []}
+    for start in range(0, len(times) - n + 1, args.wf_step_bars):
+        tr0, tr1 = times[start], times[start + args.wf_train_bars - 1]
+        te0, te1 = times[start + args.wf_train_bars], times[start + n - 1]
+        train_df = df[(pd.to_datetime(df["timestamp"]) >= tr0) & (pd.to_datetime(df["timestamp"]) <= tr1)]
+        test_df = df[(pd.to_datetime(df["timestamp"]) >= te0) & (pd.to_datetime(df["timestamp"]) <= te1)]
+        if len(train_df) < 100 or len(test_df) < 20:
+            continue
+        bundle = train_bundle(train_df, cfg)
+        metrics = evaluate(score_frame(test_df, bundle), cfg, args.min_monthly_return_pct)
+        metrics.update({"test_start": str(te0), "test_end": str(te1)})
+        windows.append(metrics)
+    pass_count = sum(1 for w in windows if w["passes_dd_lt_monthly"] and w["passes_min_monthly"])
+    return {"window_count": len(windows), "pass_rate": round(pass_count / len(windows), 6) if windows else 0.0, "windows": windows}
