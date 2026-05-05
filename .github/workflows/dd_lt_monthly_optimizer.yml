@@ -10,7 +10,7 @@ on:
       timeout_seconds:
         description: Optimizer timeout seconds
         required: true
-        default: "18000"
+        default: "1800"
       max_trials:
         description: Maximum randomized trials before timeout
         required: true
@@ -26,10 +26,14 @@ on:
       - "sontrade_bot.py"
       - "requirements.txt"
 
+concurrency:
+  group: dd-below-monthly-optimizer
+  cancel-in-progress: true
+
 jobs:
   optimize:
     runs-on: ubuntu-latest
-    timeout-minutes: 310
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,7 +59,7 @@ jobs:
             --data-provider alpaca \
             --timeframe 30m \
             --lookback-days 2500 \
-            --timeout-seconds "${{ github.event.inputs.timeout_seconds || '18000' }}" \
+            --timeout-seconds "${{ github.event.inputs.timeout_seconds || '1800' }}" \
             --max-trials "${{ github.event.inputs.max_trials || '6000' }}" \
             --min-monthly-return-pct 12 \
             --min-total-trades 120 \
