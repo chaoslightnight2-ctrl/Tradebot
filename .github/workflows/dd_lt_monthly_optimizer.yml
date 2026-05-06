@@ -1,5 +1,6 @@
 name: DD below monthly optimizer
 
+# Restart trigger for 1h monthly15 lowDD no-DD-gate run.
 on:
   workflow_dispatch:
     inputs:
