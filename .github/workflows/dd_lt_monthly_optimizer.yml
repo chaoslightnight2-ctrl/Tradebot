@@ -10,7 +10,7 @@ on:
       timeout_seconds:
         description: Optimizer timeout seconds
         required: true
-        default: "1800"
+        default: "10800"
       max_trials:
         description: Maximum randomized trials before timeout
         required: true
@@ -22,6 +22,7 @@ on:
       - "tools/optimize_dd_lt_monthly.py"
       - "tools/optimize_monthly15_lowdd.py"
       - "tools/optimize_30m_monthly15_lowdd.py"
+      - "tools/optimize_1h_monthly15_lowdd_no_dd_gate.py"
       - ".github/workflows/dd_lt_monthly_optimizer.yml"
       - "sontrade_bot.py"
       - "requirements.txt"
@@ -33,7 +34,7 @@ concurrency:
 jobs:
   optimize:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 190
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,17 +55,17 @@ jobs:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
-          python tools/optimize_30m_monthly15_lowdd.py \
+          python tools/optimize_1h_monthly15_lowdd_no_dd_gate.py \
             --symbols "${{ github.event.inputs.symbols || 'AAPL' }}" \
             --data-provider alpaca \
-            --timeframe 30m \
+            --timeframe 1h \
             --lookback-days 2500 \
-            --timeout-seconds "${{ github.event.inputs.timeout_seconds || '1800' }}" \
+            --timeout-seconds "${{ github.event.inputs.timeout_seconds || '10800' }}" \
             --max-trials "${{ github.event.inputs.max_trials || '6000' }}" \
             --min-monthly-return-pct 12 \
-            --min-total-trades 120 \
-            --min-oos-trades 40 \
-            --bars-per-year 3276
+            --min-total-trades 80 \
+            --min-oos-trades 25 \
+            --bars-per-year 1638
 
       - name: Show final report
         if: always()
@@ -77,7 +78,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: optimizer-30m-monthly15-lowdd-reports
+          name: optimizer-1h-monthly15-lowdd-no-dd-gate-reports
           path: |
             reports/dd_lt_monthly_optimizer_trials.jsonl
             reports/dd_lt_monthly_valid_candidates.json
