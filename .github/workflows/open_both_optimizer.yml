@@ -1,0 +1,67 @@
+name: OPEN both optimizer
+
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: Number of optimizer trials
+        required: true
+        default: "300"
+  push:
+    branches:
+      - main
+    paths:
+      - "tools/open_both_optimizer.py"
+      - "tests/test_open_both_optimizer.py"
+      - ".github/workflows/open_both_optimizer.yml"
+      - "sontrade_bot.py"
+      - "requirements.txt"
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Run OPEN both optimizer
+        run: |
+          python tools/open_both_optimizer.py \
+            --symbol OPEN \
+            --windows 1y,3y,5y \
+            --direction both \
+            --max-dd 20 \
+            --top 3 \
+            --trials "${{ github.event.inputs.trials || '300' }}"
+
+      - name: Show OPEN report
+        if: always()
+        run: |
+          if [ -f reports/OPEN_BOTH_TOP3_OPTIMIZER_REPORT.md ]; then
+            cat reports/OPEN_BOTH_TOP3_OPTIMIZER_REPORT.md
+          fi
+
+      - name: Upload OPEN optimizer reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-both-optimizer-reports
+          path: |
+            reports/OPEN_BOTH_TOP3_OPTIMIZER_REPORT.md
+            reports/OPEN_BOTH_TOP3_OPTIMIZER_REPORT.json
+            reports/OPEN_BOTH_TOP3_NEAR_MISSES.json
+          if-no-files-found: warn
