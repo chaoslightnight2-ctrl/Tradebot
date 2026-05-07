@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Backtest optimizer for configs where monthly return is greater than max drawdown.
+"""Backtest optimizer for SONTRADE risk/return configs.
 
 This script runs offline backtests only. It never submits orders.
+It is intentionally compatible with wrapper optimizers that monkey-patch
+`candidate_status` and `walk_forward`.
 """
 from __future__ import annotations
 
@@ -59,6 +61,26 @@ def parse_symbols(raw: str) -> tuple[str, ...]:
     return tuple(s.strip().upper() for s in raw.split(",") if s.strip())
 
 
+def total_cost_value(costs: dict[str, Any]) -> float:
+    """Read cost value from old/new cost dictionaries.
+
+    `sontrade_bot.backtest_costs` has used `total` in some versions, while this
+    optimizer originally expected `total_cost`. Accept both so every trial does
+    not fail with KeyError('total_cost').
+    """
+    if "total_cost" in costs:
+        return safe_float(costs.get("total_cost"))
+    if "total" in costs:
+        return safe_float(costs.get("total"))
+    if "total_bps" in costs:
+        return safe_float(costs.get("total_bps")) / 10_000.0
+    # Last-resort sum of known components.
+    return sum(
+        safe_float(costs.get(k))
+        for k in ("commission", "spread", "slippage", "borrow", "borrow_cost")
+    )
+
+
 def base_config(args: argparse.Namespace) -> Config:
     return Config(
         symbols=parse_symbols(args.symbols) or ("AAPL",),
@@ -95,13 +117,17 @@ def random_trials(args: argparse.Namespace) -> list[dict[str, Any]]:
         "max_positions": [1, 2, 3, 4],
     }
     keys = list(space)
-    trials = [{k: rng.choice(space[k]) for k in keys} for _ in range(args.max_trials)]
-    trials = [t for t in trials if t["min_stop_pct"] < t["max_stop_pct"]]
-    for t in trials:
+    trials = []
+    for _ in range(args.max_trials):
+        t = {k: rng.choice(space[k]) for k in keys}
+        if t["min_stop_pct"] >= t["max_stop_pct"]:
+            continue
         if t["trade_direction"] == "long":
             t["short_threshold"] = 0.99
-        if t["trade_direction"] == "short":
+        elif t["trade_direction"] == "short":
             t["long_threshold"] = 0.99
+        trials.append(t)
+
     trials.insert(0, {
         "trade_direction": "both",
         "horizon_bars": 8,
@@ -121,6 +147,8 @@ def random_trials(args: argparse.Namespace) -> list[dict[str, Any]]:
 
 def split_by_time(df: pd.DataFrame, frac: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     times = sorted(pd.to_datetime(df["timestamp"]).unique())
+    if len(times) < 3:
+        return df.iloc[:0].copy(), df.iloc[:0].copy()
     cut = times[max(1, min(len(times) - 1, int(len(times) * frac)))]
     return df[df["timestamp"] < cut].copy(), df[df["timestamp"] >= cut].copy()
 
@@ -151,16 +179,41 @@ def select_trades(scored: pd.DataFrame, cfg: Config) -> pd.DataFrame:
             continue
         gross = realized_gross_return(row, side, cfg)
         costs = backtest_costs(row, side, cfg)
-        net = gross - costs["total_cost"]
+        net = gross - total_cost_value(costs)
         atr_stop = safe_float(row.get("atr_pct")) * cfg.stop_atr_mult
         stop_pct = max(cfg.min_stop_pct, min(cfg.max_stop_pct, atr_stop))
-        rows.append({"timestamp": str(row["timestamp"]), "symbol": row.get("symbol"), "side": side, "position_return": net * cfg.risk_per_trade / stop_pct})
+        position_return = net * cfg.risk_per_trade / max(stop_pct, 1e-9)
+        rows.append({
+            "timestamp": str(row["timestamp"]),
+            "symbol": row.get("symbol"),
+            "side": side,
+            "position_return": position_return,
+            "gross_return": gross,
+            "net_return": net,
+            "cost": total_cost_value(costs),
+            "long_score": long_score,
+            "short_score": short_score,
+            "edge_gap": edge_gap,
+        })
     return pd.DataFrame(rows)
 
 
 def metrics_from_trades(trades: pd.DataFrame, start_ts: Any, end_ts: Any, min_monthly_return_pct: float) -> dict[str, Any]:
     if trades.empty or start_ts is None or end_ts is None:
-        return {"trade_count": 0, "long_trades": 0, "short_trades": 0, "win_rate_pct": 0.0, "total_return_pct": 0.0, "monthly_return_pct": 0.0, "max_drawdown_pct": 0.0, "profit_factor": 0.0, "expectancy_pct": 0.0, "dd_to_monthly_ratio": None, "passes_dd_lt_monthly": False, "passes_min_monthly": False}
+        return {
+            "trade_count": 0,
+            "long_trades": 0,
+            "short_trades": 0,
+            "win_rate_pct": 0.0,
+            "total_return_pct": 0.0,
+            "monthly_return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "profit_factor": 0.0,
+            "expectancy_pct": 0.0,
+            "dd_to_monthly_ratio": None,
+            "passes_dd_lt_monthly": False,
+            "passes_min_monthly": False,
+        }
     r = trades["position_return"].astype(float).clip(lower=-0.95)
     equity = (1.0 + r).cumprod()
     max_dd = ((equity / equity.cummax()) - 1.0).min()
@@ -172,7 +225,20 @@ def metrics_from_trades(trades: pd.DataFrame, start_ts: Any, end_ts: Any, min_mo
     monthly_pct = pct(monthly_return)
     dd_pct = pct(max_dd)
     ratio = abs(dd_pct) / monthly_pct if monthly_pct > 0 else None
-    return {"trade_count": int(len(trades)), "long_trades": int((trades["side"] == "long").sum()), "short_trades": int((trades["side"] == "short").sum()), "win_rate_pct": round(float((r > 0).mean() * 100.0), 6), "total_return_pct": pct(total_return), "monthly_return_pct": monthly_pct, "max_drawdown_pct": dd_pct, "profit_factor": round(float(wins.sum() / abs(losses.sum())), 6) if abs(losses.sum()) > 0 else None, "expectancy_pct": pct(r.mean()), "dd_to_monthly_ratio": round(float(ratio), 6) if ratio is not None else None, "passes_dd_lt_monthly": bool(monthly_pct > 0 and abs(dd_pct) < monthly_pct), "passes_min_monthly": bool(monthly_pct > min_monthly_return_pct)}
+    return {
+        "trade_count": int(len(trades)),
+        "long_trades": int((trades["side"] == "long").sum()),
+        "short_trades": int((trades["side"] == "short").sum()),
+        "win_rate_pct": round(float((r > 0).mean() * 100.0), 6),
+        "total_return_pct": pct(total_return),
+        "monthly_return_pct": monthly_pct,
+        "max_drawdown_pct": dd_pct,
+        "profit_factor": round(float(wins.sum() / abs(losses.sum())), 6) if abs(losses.sum()) > 0 else None,
+        "expectancy_pct": pct(r.mean()),
+        "dd_to_monthly_ratio": round(float(ratio), 6) if ratio is not None else None,
+        "passes_dd_lt_monthly": bool(monthly_pct > 0 and abs(dd_pct) < monthly_pct),
+        "passes_min_monthly": bool(monthly_pct > min_monthly_return_pct),
+    }
 
 
 def evaluate(scored: pd.DataFrame, cfg: Config, min_monthly_return_pct: float) -> dict[str, Any]:
@@ -197,7 +263,7 @@ def walk_forward(df: pd.DataFrame, cfg: Config, args: argparse.Namespace) -> dic
         metrics = evaluate(score_frame(test_df, train_bundle(train_df, cfg)), cfg, args.min_monthly_return_pct)
         metrics.update({"test_start": str(te0), "test_end": str(te1)})
         windows.append(metrics)
-    pass_count = sum(1 for w in windows if w["passes_dd_lt_monthly"] and w["passes_min_monthly"])
+    pass_count = sum(1 for w in windows if w.get("passes_dd_lt_monthly") and w.get("passes_min_monthly"))
     return {"window_count": len(windows), "pass_rate": round(pass_count / len(windows), 6) if windows else 0.0, "windows": windows}
 
 
@@ -235,13 +301,33 @@ def write_jsonl(path: Path, obj: dict[str, Any]) -> None:
 
 
 def make_report(best: dict[str, Any] | None, valid: list[dict[str, Any]], args: argparse.Namespace) -> str:
-    lines = ["# DD < Monthly Return Optimizer Report", "", f"Generated: {datetime.now(UTC).isoformat()}", f"Symbols: `{args.symbols}`", f"Lookback days: `{max(args.lookback_days, 1825)}`", f"Timeout seconds: `{args.timeout_seconds}`", ""]
+    lines = [
+        "# DD < Monthly Return Optimizer Report",
+        "",
+        f"Generated: {datetime.now(UTC).isoformat()}",
+        f"Symbols: `{args.symbols}`",
+        f"Lookback days: `{max(args.lookback_days, 1825)}`",
+        f"Timeout seconds: `{args.timeout_seconds}`",
+        "",
+    ]
     if best is None:
-        lines += ["## Result", "", "NO_VALID_BOT_FOUND", "", "No candidate passed monthly_return_pct > minimum, abs(max_drawdown_pct) < monthly_return_pct, trade-count, OOS, and walk-forward gates."]
+        lines += ["## Result", "", "NO_VALID_BOT_FOUND", "", "No candidate passed the active optimizer gates. See alternatives/diagnostics below."]
         return "\n".join(lines) + "\n"
     f = best["full_metrics"]
     o = best["oos_metrics"]
-    lines += ["## Result", "", "VALID_BOT_FOUND", "", "| Metric | Full | OOS |", "|---|---:|---:|", f"| Monthly return % | {f['monthly_return_pct']} | {o['monthly_return_pct']} |", f"| Max drawdown % | {f['max_drawdown_pct']} | {o['max_drawdown_pct']} |", f"| DD / monthly | {f['dd_to_monthly_ratio']} | {o['dd_to_monthly_ratio']} |", f"| Total return % | {f['total_return_pct']} | {o['total_return_pct']} |", f"| Trades | {f['trade_count']} | {o['trade_count']} |", f"| Win rate % | {f['win_rate_pct']} | {o['win_rate_pct']} |", "", f"Walk-forward pass rate: `{best['walk_forward']['pass_rate']}`", f"Score: `{best['score']}`", "", "## Selected settings", "", "```json", json.dumps(best["trial"], indent=2, ensure_ascii=False), "```", "", "## Top long feature weights"]
+    lines += [
+        "## Result", "", "VALID_BOT_FOUND", "",
+        "| Metric | Full | OOS |", "|---|---:|---:|",
+        f"| Monthly return % | {f['monthly_return_pct']} | {o['monthly_return_pct']} |",
+        f"| Max drawdown % | {f['max_drawdown_pct']} | {o['max_drawdown_pct']} |",
+        f"| DD / monthly | {f['dd_to_monthly_ratio']} | {o['dd_to_monthly_ratio']} |",
+        f"| Total return % | {f['total_return_pct']} | {o['total_return_pct']} |",
+        f"| Trades | {f['trade_count']} | {o['trade_count']} |",
+        f"| Win rate % | {f['win_rate_pct']} | {o['win_rate_pct']} |",
+        "", f"Walk-forward pass rate: `{best['walk_forward']['pass_rate']}`",
+        f"Score: `{best['score']}`", "", "## Selected settings", "", "```json",
+        json.dumps(best["trial"], indent=2, ensure_ascii=False), "```", "", "## Top long feature weights",
+    ]
     lines += [f"- `{x['feature']}`: {x['weight_pct']}%" for x in best["weights"]["long_top_features"][:12]]
     lines += ["", "## Top short feature weights"]
     lines += [f"- `{x['feature']}`: {x['weight_pct']}%" for x in best["weights"]["short_top_features"][:12]]
@@ -254,11 +340,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for p in [TRIALS_JSONL, VALID_JSON, BEST_JSON, REPORT_MD]:
         if p.exists():
             p.unlink()
-    base = base_config(args)
-    raw = fetch_bars(base)
+
+    try:
+        base = base_config(args)
+        raw = fetch_bars(base)
+    except Exception as exc:
+        result = {"status": "DATA_OR_SETUP_ERROR", "error": repr(exc), "created_at": datetime.now(UTC).isoformat()}
+        BEST_JSON.write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        REPORT_MD.write_text("# DD < Monthly Return Optimizer Report\n\nDATA_OR_SETUP_ERROR\n\n```text\n" + repr(exc) + "\n```\n", encoding="utf-8")
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return result
+
     deadline = time.monotonic() + args.timeout_seconds
     valid: list[dict[str, Any]] = []
     best: dict[str, Any] | None = None
+
     for idx, trial in enumerate(random_trials(args), start=1):
         if time.monotonic() >= deadline:
             break
@@ -273,7 +369,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             oos = evaluate(score_frame(oos_df, bundle), cfg, args.min_monthly_return_pct)
             wf = walk_forward(df, cfg, args)
             passed, score, reasons = candidate_status(full, oos, wf, args)
-            out = {"trial_index": idx, "trial": trial, "full_metrics": full, "oos_metrics": oos, "walk_forward": {k: v for k, v in wf.items() if k != "windows"}, "score": score, "passed": passed, "rejection_reasons": reasons}
+            out = {
+                "trial_index": idx,
+                "trial": trial,
+                "full_metrics": full,
+                "oos_metrics": oos,
+                "walk_forward": {k: v for k, v in wf.items() if k != "windows"},
+                "score": score,
+                "passed": passed,
+                "rejection_reasons": reasons,
+            }
             if passed:
                 out["weights"] = feature_weights(bundle)
                 valid.append(out)
@@ -282,6 +387,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             write_jsonl(TRIALS_JSONL, out)
         except Exception as exc:
             write_jsonl(TRIALS_JSONL, {"trial_index": idx, "trial": trial, "passed": False, "error": repr(exc)})
+
     valid.sort(key=lambda x: x["score"], reverse=True)
     result = {"status": "VALID_BOT_FOUND" if best else "NO_VALID_BOT_FOUND", "best_candidate": best, "valid_count": len(valid), "created_at": datetime.now(UTC).isoformat()}
     VALID_JSON.write_text(json.dumps(valid, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
