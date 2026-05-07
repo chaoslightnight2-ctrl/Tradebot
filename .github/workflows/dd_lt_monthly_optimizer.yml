@@ -10,7 +10,7 @@ on:
       timeout_seconds:
         description: Optimizer timeout seconds
         required: true
-        default: "10800"
+        default: "1800"
       max_trials:
         description: Maximum randomized trials before timeout
         required: true
@@ -35,7 +35,7 @@ concurrency:
 jobs:
   optimize:
     runs-on: ubuntu-latest
-    timeout-minutes: 190
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,7 +61,7 @@ jobs:
             --data-provider alpaca \
             --timeframe 1h \
             --lookback-days 2500 \
-            --timeout-seconds "${{ github.event.inputs.timeout_seconds || '10800' }}" \
+            --timeout-seconds "${{ github.event.inputs.timeout_seconds || '1800' }}" \
             --max-trials "${{ github.event.inputs.max_trials || '6000' }}" \
             --min-monthly-return-pct 12 \
             --min-total-trades 80 \
@@ -91,4 +91,5 @@ jobs:
             reports/dd_lt_monthly_best_config.json
             reports/DD_LT_MONTHLY_OPTIMIZER_REPORT.md
             reports/optimizer_top_alternatives.json
+            reports/optimizer_error_summary.json
           if-no-files-found: warn
