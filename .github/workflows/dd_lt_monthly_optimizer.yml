@@ -1,6 +1,5 @@
 name: DD below monthly optimizer
 
-# Restart trigger for 1h monthly15 lowDD no-DD-gate run.
 on:
   workflow_dispatch:
     inputs:
@@ -24,6 +23,7 @@ on:
       - "tools/optimize_monthly15_lowdd.py"
       - "tools/optimize_30m_monthly15_lowdd.py"
       - "tools/optimize_1h_monthly15_lowdd_no_dd_gate.py"
+      - "tools/summarize_optimizer_alternatives.py"
       - ".github/workflows/dd_lt_monthly_optimizer.yml"
       - "sontrade_bot.py"
       - "requirements.txt"
@@ -68,6 +68,11 @@ jobs:
             --min-oos-trades 25 \
             --bars-per-year 1638
 
+      - name: Append alternatives
+        if: always()
+        run: |
+          python tools/summarize_optimizer_alternatives.py || true
+
       - name: Show final report
         if: always()
         run: |
@@ -85,4 +90,5 @@ jobs:
             reports/dd_lt_monthly_valid_candidates.json
             reports/dd_lt_monthly_best_config.json
             reports/DD_LT_MONTHLY_OPTIMIZER_REPORT.md
+            reports/optimizer_top_alternatives.json
           if-no-files-found: warn
